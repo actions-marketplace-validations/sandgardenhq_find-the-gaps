@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/log"
 	"github.com/sandgardenhq/find-the-gaps/internal/analyzer"
 	"github.com/sandgardenhq/find-the-gaps/internal/doctor"
+	"github.com/sandgardenhq/find-the-gaps/internal/forge"
 	"github.com/sandgardenhq/find-the-gaps/internal/parallel"
 	"github.com/sandgardenhq/find-the-gaps/internal/reporter"
 	"github.com/sandgardenhq/find-the-gaps/internal/scanner"
@@ -105,6 +106,7 @@ func newAnalyzeCmd() *cobra.Command {
 		siteMode                     string
 		noSite                       bool
 		keepSiteSource               bool
+		forgeFlag                    string
 	)
 
 	cmd := &cobra.Command{
@@ -145,18 +147,48 @@ func newAnalyzeCmd() *cobra.Command {
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), formatScanSummary(stats))
 			}
 
-			required := []string{"mdfetch"}
+			// Resolve the docs URL up front so we can size the precheck list
+			// to the work we will actually do: mdfetch is only needed when we
+			// crawl the live site, not when on-disk mode synthesizes pages
+			// from the repo.
+			resolved, err := forge.Resolve(docsURL, repoPath, forgeFlag)
+			if err != nil {
+				if errors.Is(err, forge.ErrForgeNotIngestable) {
+					// Capitalized leading word is intentional: "Find the Gaps"
+					// is the product name and must lead the user-facing
+					// message. ST1005's lower-case-first rule does not apply
+					// to proper nouns.
+					return fmt.Errorf( //nolint:staticcheck // ST1005: proper-noun lead-in
+						"Find the Gaps can't crawl source-control forges "+
+							"(github.com, gitlab.com, bitbucket.org, codeberg.org, git.sr.ht). "+
+							"To analyze these docs, clone the repo locally and pass --repo /path/to/it. "+
+							"(%w)", err)
+				}
+				return err
+			}
+
+			// Build the precheck list from the resolution outcome: mdfetch is
+			// only needed when we will actually crawl the docs site, and hugo
+			// is only needed when we will render the report. Skipping the
+			// precheck entirely when both are unneeded keeps on-disk + --no-site
+			// runs free of environment-specific install requirements.
+			required := make([]string, 0, 2)
 			suffix := ""
+			if !resolved.OnDisk {
+				required = append(required, "mdfetch")
+			}
 			if !noSite {
 				required = append(required, "hugo")
 				suffix = "Pass --no-site to skip Hugo."
 			}
-			if err := requireExternalTools(ctx, doctor.Precheck{
-				Command: "ftg analyze",
-				Tools:   required,
-				Suffix:  suffix,
-			}); err != nil {
-				return err
+			if len(required) > 0 {
+				if err := requireExternalTools(ctx, doctor.Precheck{
+					Command: "ftg analyze",
+					Tools:   required,
+					Suffix:  suffix,
+				}); err != nil {
+					return err
+				}
 			}
 
 			if llmSmall == "" {
@@ -183,17 +215,24 @@ func newAnalyzeCmd() *cobra.Command {
 				defer logLLMCallCounts(t)
 			}
 
-			log.Infof("crawling %s", docsURL)
 			docsDir := filepath.Join(projectDir, "docs")
-			spiderOpts := spider.Options{
-				CacheDir: docsDir,
-				Workers:  workers,
+
+			var pages map[string]string
+			if resolved.OnDisk {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), resolved.Notice)
+				pages = resolved.Pages
+			} else {
+				log.Infof("crawling %s", docsURL)
+				spiderOpts := spider.Options{
+					CacheDir: docsDir,
+					Workers:  workers,
+				}
+				pages, err = spider.Crawl(docsURL, spiderOpts, spider.MdfetchFetcher(spiderOpts))
+				if err != nil {
+					return fmt.Errorf("crawl failed: %w", err)
+				}
+				log.Debug("crawl complete", "pages", len(pages))
 			}
-			pages, err := spider.Crawl(docsURL, spiderOpts, spider.MdfetchFetcher(spiderOpts))
-			if err != nil {
-				return fmt.Errorf("crawl failed: %w", err)
-			}
-			log.Debug("crawl complete", "pages", len(pages))
 
 			idx, err := spider.LoadIndex(docsDir)
 			if err != nil {
@@ -678,6 +717,8 @@ func newAnalyzeCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&noSite, "no-site", false, "skip the Hugo site build; markdown reports still emitted")
 	cmd.Flags().BoolVar(&keepSiteSource, "keep-site-source", true,
 		"preserve generated Hugo source at <projectDir>/site-src/ (default true; pass --keep-site-source=false to discard)")
+	cmd.Flags().StringVar(&forgeFlag, "forge", "",
+		"override forge detection: github|gitlab|bitbucket|gitea|forgejo|gogs (use for self-hosted forges)")
 
 	return cmd
 }
