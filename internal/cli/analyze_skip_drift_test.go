@@ -102,7 +102,7 @@ func seedSkipDriftFixture(t *testing.T, repoDir, projectDir, docsURL string) {
 	filename := spider.URLToFilename(docsURL)
 	require.NoError(t, os.WriteFile(filepath.Join(docsDir, filename), []byte("# Doc page\n\nFeature one is documented.\n"), 0o644))
 	require.NoError(t, idx.Record(docsURL, filename))
-	require.NoError(t, idx.RecordAnalysis(docsURL, "Covers feature one.", []string{"feature-one"}, true))
+	require.NoError(t, idx.RecordAnalysis(docsURL, "Covers feature one.", []string{"feature-one"}, true, "reference"))
 	require.NoError(t, idx.SetProductSummary("A test product.", []string{"feature-one"}))
 
 	require.NoError(t, os.MkdirAll(projectDir, 0o755))
@@ -122,11 +122,11 @@ func seedSkipDriftFixture(t *testing.T, repoDir, projectDir, docsURL string) {
 }
 
 // TestAnalyzeSkipsDriftOnSecondRun exercises the four scenarios from the plan:
-//   1. Cold run — drift runs, gaps.md written, drift.json gets a complete sentinel.
-//   2. Warm run — same inputs, drift skipped, gaps.md untouched.
-//   3. Mutate inputs — featuremap.json changed, drift re-runs, hash changes.
-//   4. Delete gaps.md — even with an unchanged hash, the absence of gaps.md
-//      forces drift to re-run.
+//  1. Cold run — drift runs, gaps.md written, drift.json gets a complete sentinel.
+//  2. Warm run — same inputs, drift skipped, gaps.md untouched.
+//  3. Mutate inputs — featuremap.json changed, drift re-runs, hash changes.
+//  4. Delete gaps.md — even with an unchanged hash, the absence of gaps.md
+//     forces drift to re-run.
 //
 // Investigator activity is measured by counting CompleteWithTools calls on the
 // injected stub — that is the clearest signal that DetectDrift actually fired.

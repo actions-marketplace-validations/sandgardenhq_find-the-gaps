@@ -209,3 +209,63 @@ func TestAnalyzePage_SkipsOnTokenBudgetError(t *testing.T) {
 		t.Fatal("test stub misconfigured: forcedErr should be ErrTokenBudgetExceeded")
 	}
 }
+
+func TestAnalyzePage_ParsesRole(t *testing.T) {
+	c := &fakeClient{jsonResponses: map[string]json.RawMessage{
+		"analyze_page_response": json.RawMessage(
+			`{"summary":"Quickstart page.","features":["install"],"is_docs":true,"role":"quickstart"}`),
+	}}
+	got, err := analyzer.AnalyzePage(context.Background(), &fakeTiering{small: c},
+		"https://docs.example.com/intro", "content")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Role != "quickstart" {
+		t.Errorf("Role = %q, want %q", got.Role, "quickstart")
+	}
+}
+
+func TestAnalyzePage_MissingRole_DefaultsToOther(t *testing.T) {
+	c := &fakeClient{jsonResponses: map[string]json.RawMessage{
+		"analyze_page_response": json.RawMessage(
+			`{"summary":"Old cache shape.","features":[],"is_docs":true}`),
+	}}
+	got, err := analyzer.AnalyzePage(context.Background(), &fakeTiering{small: c},
+		"https://docs.example.com/x", "content")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Role != "other" {
+		t.Errorf("Role = %q, want %q (inclusive-by-default for missing field)", got.Role, "other")
+	}
+}
+
+func TestAnalyzePage_PromptIncludesRoleRubric(t *testing.T) {
+	c := &fakeClient{jsonResponses: map[string]json.RawMessage{
+		"analyze_page_response": json.RawMessage(
+			`{"summary":"x","features":[],"is_docs":true,"role":"other"}`),
+	}}
+	_, err := analyzer.AnalyzePage(context.Background(), &fakeTiering{small: c},
+		"https://example.com", "content")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.receivedPrompts) == 0 {
+		t.Fatal("expected a prompt")
+	}
+	captured := c.receivedPrompts[0]
+	wants := []string{
+		`"role":`,
+		"landing", "quickstart", "tutorial", "how-to",
+		"concept", "reference", "changelog", "faq", "other",
+		"Judge from the content",
+		"Role definitions:",
+		"numbered steps, minimal explanation",
+		"primarily navigation and links, not explanatory prose",
+	}
+	for _, w := range wants {
+		if !strings.Contains(captured, w) {
+			t.Errorf("prompt missing %q", w)
+		}
+	}
+}

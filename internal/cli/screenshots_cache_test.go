@@ -16,9 +16,10 @@ import (
 func TestScreenshotsCache_roundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "screenshots.json")
 	in := map[string]screenshotsCacheEntry{
-		screenshotsCacheKey("https://docs.example.com/auth", "hash-auth"): {
+		screenshotsCacheKey("https://docs.example.com/auth", "hash-auth", "other"): {
 			URL:         "https://docs.example.com/auth",
 			ContentHash: "hash-auth",
+			Role:        "other",
 			Stats: analyzer.ScreenshotPageStats{
 				PageURL:            "https://docs.example.com/auth",
 				VisionEnabled:      true,
@@ -49,9 +50,10 @@ func TestScreenshotsCache_roundTrip(t *testing.T) {
 				PriorityReason:  "misleading users",
 			}},
 		},
-		screenshotsCacheKey("https://docs.example.com/search", "hash-search"): {
+		screenshotsCacheKey("https://docs.example.com/search", "hash-search", "other"): {
 			URL:         "https://docs.example.com/search",
 			ContentHash: "hash-search",
+			Role:        "other",
 			Stats: analyzer.ScreenshotPageStats{
 				PageURL:       "https://docs.example.com/search",
 				VisionEnabled: false,
@@ -67,7 +69,7 @@ func TestScreenshotsCache_roundTrip(t *testing.T) {
 	require.True(t, ok)
 	require.Len(t, got, 2)
 
-	authKey := screenshotsCacheKey("https://docs.example.com/auth", "hash-auth")
+	authKey := screenshotsCacheKey("https://docs.example.com/auth", "hash-auth", "other")
 	require.Contains(t, got, authKey)
 	assert.Equal(t, in[authKey].URL, got[authKey].URL)
 	assert.Equal(t, in[authKey].ContentHash, got[authKey].ContentHash)
@@ -128,9 +130,10 @@ func TestScreenshotsCachePersister_concurrentCallersDoNotLoseUpdates(t *testing.
 func TestScreenshotsCacheComplete_roundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "screenshots.json")
 	in := map[string]screenshotsCacheEntry{
-		screenshotsCacheKey("https://x/auth", "h1"): {
+		screenshotsCacheKey("https://x/auth", "h1", "other"): {
 			URL:         "https://x/auth",
 			ContentHash: "h1",
+			Role:        "other",
 			Stats:       analyzer.ScreenshotPageStats{PageURL: "https://x/auth"},
 			Missing:     []analyzer.ScreenshotGap{},
 			Possibly:    []analyzer.ScreenshotGap{},
@@ -151,14 +154,14 @@ func TestScreenshotsCacheComplete_roundTrip(t *testing.T) {
 func TestScreenshotsCache_entriesAreSortedByURL(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "screenshots.json")
 	in := map[string]screenshotsCacheEntry{
-		screenshotsCacheKey("https://docs.example.com/zebra", "hz"): {
-			URL: "https://docs.example.com/zebra", ContentHash: "hz",
+		screenshotsCacheKey("https://docs.example.com/zebra", "hz", "other"): {
+			URL: "https://docs.example.com/zebra", ContentHash: "hz", Role: "other",
 		},
-		screenshotsCacheKey("https://docs.example.com/alpha", "ha"): {
-			URL: "https://docs.example.com/alpha", ContentHash: "ha",
+		screenshotsCacheKey("https://docs.example.com/alpha", "ha", "other"): {
+			URL: "https://docs.example.com/alpha", ContentHash: "ha", Role: "other",
 		},
-		screenshotsCacheKey("https://docs.example.com/mango", "hm"): {
-			URL: "https://docs.example.com/mango", ContentHash: "hm",
+		screenshotsCacheKey("https://docs.example.com/mango", "hm", "other"): {
+			URL: "https://docs.example.com/mango", ContentHash: "hm", Role: "other",
 		},
 	}
 	require.NoError(t, saveScreenshotsCache(path, in))
@@ -174,12 +177,99 @@ func TestScreenshotsCache_entriesAreSortedByURL(t *testing.T) {
 	assert.Less(t, iMango, iZebra)
 }
 
+// TestScreenshotsCachedFromCli_preservesRole guards against an asymmetry
+// between the cli<->analyzer adapter pair: screenshotsCacheEntryFromAnalyzer
+// already copies Role, but screenshotsCachedFromCli used to drop it. Cache
+// lookup keys embed role separately so the bug was latent at runtime, but
+// any future reader of ScreenshotsCachedPage.Role on a cache-hit path would
+// see the zero value instead of the actual stored role.
+func TestScreenshotsCachedFromCli_preservesRole(t *testing.T) {
+	in := map[string]screenshotsCacheEntry{
+		screenshotsCacheKey("https://docs.example.com/q", "h1", "quickstart"): {
+			URL:         "https://docs.example.com/q",
+			ContentHash: "h1",
+			Role:        "quickstart",
+			Stats:       analyzer.ScreenshotPageStats{PageURL: "https://docs.example.com/q"},
+			Missing:     []analyzer.ScreenshotGap{},
+			Possibly:    []analyzer.ScreenshotGap{},
+			ImageIssues: []analyzer.ImageIssue{},
+		},
+	}
+	out := screenshotsCachedFromCli(in)
+	require.Len(t, out, 1)
+	for _, v := range out {
+		assert.Equal(t, "quickstart", v.Role)
+	}
+}
+
+// TestComputeScreenshotsInputHash_roleAffectsHash guards the completion
+// sentinel against a silent-drop trap: when a docs page's role is
+// reclassified between runs (content unchanged, model unchanged), the
+// sentinel hash MUST change so the screenshot pass re-runs the page.
+// Without role in the sentinel, the per-page cache's role-aware key
+// would miss while the sentinel match short-circuits the whole pass —
+// dropping the page's findings entirely.
+func TestComputeScreenshotsInputHash_roleAffectsHash(t *testing.T) {
+	pagesA := []analyzer.DocPage{{
+		URL:     "https://docs.example.com/p",
+		Content: "# Page\n\nHello.\n",
+		Role:    "quickstart",
+	}}
+	pagesB := []analyzer.DocPage{{
+		URL:     "https://docs.example.com/p",
+		Content: "# Page\n\nHello.\n",
+		Role:    "reference",
+	}}
+	llmSmall := "anthropic/claude-haiku-4-5"
+
+	hashA := computeScreenshotsInputHash(pagesA, llmSmall)
+	hashB := computeScreenshotsInputHash(pagesB, llmSmall)
+	assert.NotEqual(t, hashA, hashB,
+		"hash must differ when only Role differs; otherwise a role reclassification silently drops findings")
+}
+
+// TestLoadScreenshotsCache_LegacyEntryNormalizesRoleOnLoad pins that an
+// on-disk entry written before the role-aware cache key shipped (no `role`
+// field, so it unmarshals with Role="") is normalized to "other" at load
+// time. Without this, the entry is keyed `url|hash|` and current lookups
+// (which always pass NormalizeRole(page.Role) == "other") miss forever,
+// leaving the legacy record as a permanent orphan that bloats the cache
+// file. Mirrors the analyzer-side NormalizeRole behavior.
+func TestLoadScreenshotsCache_LegacyEntryNormalizesRoleOnLoad(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "screenshots.json")
+	// Hand-write a legacy file: entry has no role field (omitempty kept it
+	// out on the save path that produced it).
+	raw := `{
+	  "pages": ["https://docs.example.com/legacy"],
+	  "entries": [
+	    {
+	      "url": "https://docs.example.com/legacy",
+	      "contentHash": "legacy-hash",
+	      "stats": {"pageUrl": "https://docs.example.com/legacy"},
+	      "missing": [],
+	      "possiblyCovered": [],
+	      "imageIssues": []
+	    }
+	  ]
+	}`
+	require.NoError(t, os.WriteFile(path, []byte(raw), 0o644))
+
+	got, ok := loadScreenshotsCache(path)
+	require.True(t, ok)
+	require.Len(t, got, 1)
+
+	// Current lookup paths always use the normalized role.
+	wantKey := screenshotsCacheKey("https://docs.example.com/legacy", "legacy-hash", analyzer.NormalizeRole(""))
+	require.Contains(t, got, wantKey, "legacy entry without `role` must be reachable via the normalized lookup key")
+	assert.Equal(t, "other", got[wantKey].Role, "legacy Role must be normalized to \"other\" on load")
+}
+
 func TestScreenshotsCachePages_listedSortedByURL(t *testing.T) {
 	// Pages list mirrors sorted entry URLs.
 	path := filepath.Join(t.TempDir(), "screenshots.json")
 	in := map[string]screenshotsCacheEntry{
-		screenshotsCacheKey("https://x/zebra", "hz"): {URL: "https://x/zebra", ContentHash: "hz"},
-		screenshotsCacheKey("https://x/alpha", "ha"): {URL: "https://x/alpha", ContentHash: "ha"},
+		screenshotsCacheKey("https://x/zebra", "hz", "other"): {URL: "https://x/zebra", ContentHash: "hz", Role: "other"},
+		screenshotsCacheKey("https://x/alpha", "ha", "other"): {URL: "https://x/alpha", ContentHash: "ha", Role: "other"},
 	}
 	require.NoError(t, saveScreenshotsCache(path, in))
 	file, ok := loadScreenshotsCacheFile(path)

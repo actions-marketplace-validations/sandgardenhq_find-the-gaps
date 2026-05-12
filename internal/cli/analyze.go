@@ -259,13 +259,14 @@ func newAnalyzeCmd() *cobra.Command {
 			}
 			jobs := make([]pageJob, 0, len(pages))
 			for url, filePath := range pages {
-				if summary, features, isDocs, ok := idx.Analysis(url); ok {
+				if summary, features, isDocs, role, ok := idx.Analysis(url); ok {
 					log.Debug("page cache hit", "url", url)
 					analyses = append(analyses, analyzer.PageAnalysis{
 						URL:      url,
 						Summary:  summary,
 						Features: features,
 						IsDocs:   isDocs,
+						Role:     role,
 					})
 					continue
 				}
@@ -285,7 +286,7 @@ func newAnalyzeCmd() *cobra.Command {
 					log.Warnf("skipping %s: %v", j.url, analyzeErr)
 					return nil
 				}
-				if recErr := idx.RecordAnalysis(j.url, pa.Summary, pa.Features, pa.IsDocs); recErr != nil {
+				if recErr := idx.RecordAnalysis(j.url, pa.Summary, pa.Features, pa.IsDocs, pa.Role); recErr != nil {
 					return fmt.Errorf("record analysis: %w", recErr)
 				}
 				analysesMu.Lock()
@@ -314,6 +315,18 @@ func newAnalyzeCmd() *cobra.Command {
 			if err := allNotDocsGuard(analyses); err != nil {
 				return err
 			}
+
+			// Build a per-run role resolver from the page-analysis cache so
+			// both the drift judge prompt's "Page role hints:" block AND the
+			// screenshot prompts' page_role hint reflect content-classified
+			// roles instead of URL-segment heuristics. Hoisted above the
+			// drift branch so warm-cache (drift-skipped) runs still populate
+			// DocPage.Role for the screenshot pass.
+			rolesByURL := make(map[string]string, len(analyses))
+			for _, pa := range analyses {
+				rolesByURL[pa.URL] = pa.Role
+			}
+			roleResolver := analyzer.NewRoleResolver(rolesByURL)
 
 			// Use cached synthesis when all pages were cache hits.
 			log.Infof("synthesizing product from %d pages...", len(analyses))
@@ -550,7 +563,7 @@ func newAnalyzeCmd() *cobra.Command {
 
 				driftFindings, err = analyzer.DetectDrift(
 					ctx, tiering, featureMap, docsFeatureMap,
-					pageReader, repoPath,
+					pageReader, roleResolver, repoPath,
 					workers,
 					cached, driftOnFinding, onFeatureDone,
 				)
@@ -592,6 +605,14 @@ func newAnalyzeCmd() *cobra.Command {
 				screenshotsCachePath := filepath.Join(projectDir, "screenshots-cache.json")
 				screenshotsMdPath := filepath.Join(projectDir, "screenshots.md")
 				docPages := buildScreenshotDocPages(pages, analyses)
+				// Stamp the content-classified role onto each DocPage so the
+				// screenshot prompts' page_role hint reflects the same value
+				// the drift judge sees. rolesByURL was built above, hoisted
+				// out of the drift block so warm-cache (drift-skipped) runs
+				// still populate it for this pass.
+				for i := range docPages {
+					docPages[i].Role = rolesByURL[docPages[i].URL]
+				}
 				wantScreenshotsHash := computeScreenshotsInputHash(docPages, llmSmall)
 
 				if !noCache {

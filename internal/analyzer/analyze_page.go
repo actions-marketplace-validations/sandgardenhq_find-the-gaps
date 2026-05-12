@@ -17,6 +17,9 @@ type analyzePageResponse struct {
 	// dropping the page as not-docs. False negatives are worse than
 	// false positives — see .plans/DOCS_CLASSIFIER_DESIGN.md.
 	IsDocs *bool `json:"is_docs"`
+	// Pointer so we can detect "missing from response" and apply the
+	// inclusive-by-default rule (treat as "other") instead of erroring.
+	Role *string `json:"role"`
 }
 
 // PROMPT SCHEMA: output shape for AnalyzePage.
@@ -27,9 +30,13 @@ var analyzePageSchema = JSONSchema{
       "properties": {
         "summary":  {"type": "string"},
         "features": {"type": "array", "items": {"type": "string"}},
-        "is_docs":  {"type": "boolean"}
+        "is_docs":  {"type": "boolean"},
+        "role": {
+          "type": "string",
+          "enum": ["landing","quickstart","tutorial","how-to","concept","reference","changelog","faq","other"]
+        }
       },
-      "required": ["summary", "features", "is_docs"],
+      "required": ["summary", "features", "is_docs", "role"],
       "additionalProperties": false
     }`),
 }
@@ -51,9 +58,21 @@ Populate the response with:
 - "summary": a 1-2 sentence description of what this page covers
 - "features": a list of product features or capabilities described on this page (short noun phrases, max 8 words each). May be empty.
 - "is_docs": a boolean classifying whether this page is product DOCUMENTATION.
+- "role": the kind of page this is — one of "landing", "quickstart", "tutorial", "how-to", "concept", "reference", "changelog", "faq", "other". Judge from the content; use the URL only as a tiebreaker.
 
 Rule for is_docs:
 A page is DOCS if a user trying to USE this product would consult it for current technical information about features, APIs, configuration, or behavior. Marketing pages and blog posts are NEVER docs, even when they contain code snippets, release announcements, or technical claims — docs is the canonical reference surface, not promotional or editorial content.
+
+Role definitions:
+- "landing": the docs-site home or a section index page; primarily navigation and links, not explanatory prose.
+- "quickstart": a first-time-user install + first command/run page; the reader's goal is "get something working in N minutes".
+- "tutorial": a walked-through, end-to-end guided learning of a single task. Interleaves explanation with steps and explains *why*, not just *how*. Reader is following along to learn.
+- "how-to": recipe-style guide (numbered steps, minimal explanation). Reader's goal is to accomplish one task; conceptual context is minimal or omitted.
+- "concept": background, architecture, design rationale, or model explanation; light on procedure.
+- "reference": exhaustive API / CLI / config / option listing; not a guide.
+- "changelog": release notes, version history, or "what's new".
+- "faq": Q&A format or a troubleshooting list.
+- "other": anything else, including non-docs pages (marketing, blog, team, careers, legal). Pages with is_docs=false should typically be "other".
 
 Examples of docs (is_docs=true):
 - API references, tutorials, quickstarts, configuration references
@@ -101,10 +120,19 @@ Set is_docs=false when the page is one of the not-docs categories above. Default
 		isDocs = *resp.IsDocs
 	}
 
+	// Inclusive-by-default: a missing role (e.g. an old cached response
+	// or a token-budget skip) resolves to "other" so downstream consumers
+	// can treat it uniformly with explicitly low-prominence pages.
+	role := "other"
+	if resp.Role != nil {
+		role = *resp.Role
+	}
+
 	return PageAnalysis{
 		URL:      pageURL,
 		Summary:  resp.Summary,
 		Features: resp.Features,
 		IsDocs:   isDocs,
+		Role:     role,
 	}, nil
 }

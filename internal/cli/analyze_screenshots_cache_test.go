@@ -94,7 +94,7 @@ func seedScreenshotsFixture(t *testing.T, repoDir, projectDir string, urls []str
 		filename := spider.URLToFilename(url)
 		require.NoError(t, os.WriteFile(filepath.Join(docsDir, filename), []byte(contentByURL[url]), 0o644))
 		require.NoError(t, idx.Record(url, filename))
-		require.NoError(t, idx.RecordAnalysis(url, "doc page.", []string{"feature-one"}, true))
+		require.NoError(t, idx.RecordAnalysis(url, "doc page.", []string{"feature-one"}, true, "reference"))
 	}
 	require.NoError(t, idx.SetProductSummary("A test product.", []string{"feature-one"}))
 
@@ -138,18 +138,23 @@ func TestAnalyze_screenshotsSkipOnCachedComplete(t *testing.T) {
 		map[string]string{docsURL: pageContent})
 
 	llmSmall := "ollama/test"
+	// Role must mirror what seedScreenshotsFixture stores in the
+	// page-analysis cache so the sentinel hash matches what analyze
+	// will compute when it stamps Role onto docPages from that cache.
 	docPages := []analyzer.DocPage{{
 		URL:     docsURL,
 		Path:    filepath.Join(projectDir, "docs", spider.URLToFilename(docsURL)),
 		Content: pageContent,
+		Role:    "reference",
 	}}
 	wantHash := computeScreenshotsInputHash(docPages, llmSmall)
 
 	screenshotsCachePath := filepath.Join(projectDir, "screenshots-cache.json")
 	live := map[string]screenshotsCacheEntry{
-		screenshotsCacheKey(docsURL, hashStr(pageContent)): {
+		screenshotsCacheKey(docsURL, hashStr(pageContent), "reference"): {
 			URL:         docsURL,
 			ContentHash: hashStr(pageContent),
+			Role:        "reference",
 			Stats: analyzer.ScreenshotPageStats{
 				PageURL:            docsURL,
 				MissingScreenshots: 0,
@@ -234,9 +239,10 @@ func TestAnalyze_screenshotsResumesAfterPartialCache(t *testing.T) {
 	// Pre-seed cache with the A entry only; no completion sentinel.
 	screenshotsCachePath := filepath.Join(projectDir, "screenshots-cache.json")
 	live := map[string]screenshotsCacheEntry{
-		screenshotsCacheKey(docsURLA, hashStr(contentA)): {
+		screenshotsCacheKey(docsURLA, hashStr(contentA), "reference"): {
 			URL:         docsURLA,
 			ContentHash: hashStr(contentA),
+			Role:        "reference",
 			Stats: analyzer.ScreenshotPageStats{
 				PageURL:            docsURLA,
 				MissingScreenshots: 0,
@@ -281,4 +287,3 @@ func TestAnalyze_screenshotsResumesAfterPartialCache(t *testing.T) {
 	require.NotEmpty(t, file.Complete.Hash)
 	assert.Len(t, file.Entries, 2, "final cache must contain both pages")
 }
-

@@ -27,11 +27,14 @@ type screenshotsCacheFile struct {
 }
 
 // screenshotsCacheEntry is one cached page result. The composite key is
-// URL+ContentHash so a docs page whose content has changed produces a fresh
-// entry rather than reusing a stale one.
+// URL+ContentHash+Role so a docs page whose content has changed produces a
+// fresh entry rather than reusing a stale one — and so a page whose role is
+// reclassified between runs (content unchanged) does NOT replay findings
+// whose priority / priority_reason were produced under the prior role.
 type screenshotsCacheEntry struct {
 	URL         string                       `json:"url"`
 	ContentHash string                       `json:"contentHash"`
+	Role        string                       `json:"role"`
 	Stats       analyzer.ScreenshotPageStats `json:"stats"`
 	Missing     []analyzer.ScreenshotGap     `json:"missing"`
 	Possibly    []analyzer.ScreenshotGap     `json:"possiblyCovered"`
@@ -50,8 +53,13 @@ type screenshotsComplete struct {
 // screenshotsCacheKey returns the composite map key for a screenshots cache
 // entry. The pipe separator is illegal in URLs and hex hashes so the
 // concatenation is unambiguous.
-func screenshotsCacheKey(url, contentHash string) string {
-	return url + "|" + contentHash
+//
+// role MUST be the same normalized value the analyzer stamps onto its
+// ScreenshotsCachedPage entries (empty -> "other"). Including it in the key
+// makes role reclassification between runs invalidate cached findings whose
+// priority / priority_reason were computed under the prior role.
+func screenshotsCacheKey(url, contentHash, role string) string {
+	return url + "|" + contentHash + "|" + role
 }
 
 // loadScreenshotsCacheFile returns the full screenshotsCacheFile (entries +
@@ -102,9 +110,17 @@ func screenshotsCacheEntriesToMap(entries []screenshotsCacheEntry) map[string]sc
 		if issues == nil {
 			issues = []analyzer.ImageIssue{}
 		}
-		m[screenshotsCacheKey(e.URL, e.ContentHash)] = screenshotsCacheEntry{
+		// Normalize role at load time so legacy entries (written before the
+		// role-aware key shipped, no `role` field on disk → Role == "") are
+		// keyed the same way every current lookup keys them — i.e. via
+		// analyzer.NormalizeRole(page.Role), which maps "" → "other". Without
+		// this, legacy records key `url|hash|`, but lookups always go to
+		// `url|hash|other`, so the entries become permanent orphans.
+		role := analyzer.NormalizeRole(e.Role)
+		m[screenshotsCacheKey(e.URL, e.ContentHash, role)] = screenshotsCacheEntry{
 			URL:         e.URL,
 			ContentHash: e.ContentHash,
+			Role:        role,
 			Stats:       e.Stats,
 			Missing:     missing,
 			Possibly:    possibly,
@@ -154,6 +170,7 @@ func saveScreenshotsCacheComplete(path string, current map[string]screenshotsCac
 		entries = append(entries, screenshotsCacheEntry{
 			URL:         c.URL,
 			ContentHash: c.ContentHash,
+			Role:        c.Role,
 			Stats:       c.Stats,
 			Missing:     missing,
 			Possibly:    possibly,
@@ -195,15 +212,21 @@ func saveScreenshotsCacheComplete(path string, current map[string]screenshotsCac
 }
 
 // computeScreenshotsInputHash returns a hex SHA-256 over the inputs the
-// screenshot pass consumes from upstream (page URLs + content hash + small-tier
-// model identity). It is independent of slice iteration order — pages are
-// sorted by URL before hashing. The model identity is folded in so a model
-// change forces a re-run (different vision behavior produces different audit
-// stats and findings).
+// screenshot pass consumes from upstream (page URLs + content hash +
+// normalized role + small-tier model identity). It is independent of slice
+// iteration order — pages are sorted by URL before hashing. The model
+// identity is folded in so a model change forces a re-run (different vision
+// behavior produces different audit stats and findings); the normalized
+// role is folded in so a role reclassification on stable content + model
+// invalidates the completion sentinel and forces a fresh pass — otherwise
+// the per-page cache's role-aware key (URL|Hash|Role) would miss while the
+// sentinel match short-circuits the whole pass, silently dropping that
+// page's findings.
 func computeScreenshotsInputHash(docPages []analyzer.DocPage, llmSmall string) string {
 	type pEntry struct {
 		URL  string `json:"url"`
 		Hash string `json:"hash"`
+		Role string `json:"role"`
 	}
 	type payload struct {
 		Pages []pEntry `json:"pages"`
@@ -213,7 +236,11 @@ func computeScreenshotsInputHash(docPages []analyzer.DocPage, llmSmall string) s
 	entries := make([]pEntry, 0, len(docPages))
 	for _, p := range docPages {
 		sum := sha256.Sum256([]byte(p.Content))
-		entries = append(entries, pEntry{URL: p.URL, Hash: hex.EncodeToString(sum[:])})
+		entries = append(entries, pEntry{
+			URL:  p.URL,
+			Hash: hex.EncodeToString(sum[:]),
+			Role: analyzer.NormalizeRole(p.Role),
+		})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].URL < entries[j].URL })
 
@@ -232,6 +259,7 @@ func screenshotsCachedFromCli(in map[string]screenshotsCacheEntry) map[string]an
 		out[k] = analyzer.ScreenshotsCachedPage{
 			URL:         v.URL,
 			ContentHash: v.ContentHash,
+			Role:        v.Role,
 			Stats:       v.Stats,
 			Missing:     v.Missing,
 			Possibly:    v.Possibly,
@@ -248,6 +276,7 @@ func screenshotsCacheEntryFromAnalyzer(in analyzer.ScreenshotsCachedPage) screen
 	return screenshotsCacheEntry{
 		URL:         in.URL,
 		ContentHash: in.ContentHash,
+		Role:        in.Role,
 		Stats:       in.Stats,
 		Missing:     in.Missing,
 		Possibly:    in.Possibly,
@@ -264,7 +293,7 @@ func screenshotResultFromCache(cache map[string]screenshotsCacheEntry, docPages 
 	for _, p := range docPages {
 		sum := sha256.Sum256([]byte(p.Content))
 		hash := hex.EncodeToString(sum[:])
-		c, ok := cache[screenshotsCacheKey(p.URL, hash)]
+		c, ok := cache[screenshotsCacheKey(p.URL, hash, analyzer.NormalizeRole(p.Role))]
 		if !ok {
 			continue
 		}
@@ -288,7 +317,7 @@ func newScreenshotsCachePersister(live map[string]screenshotsCacheEntry, path st
 	return func(entry screenshotsCacheEntry) error {
 		mu.Lock()
 		defer mu.Unlock()
-		live[screenshotsCacheKey(entry.URL, entry.ContentHash)] = entry
+		live[screenshotsCacheKey(entry.URL, entry.ContentHash, entry.Role)] = entry
 		return saveScreenshotsCache(path, live)
 	}
 }

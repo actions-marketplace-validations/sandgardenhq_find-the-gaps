@@ -48,28 +48,41 @@ func TestValidateScreenshotGapAcceptsValid(t *testing.T) {
 	}
 }
 
-func TestBuildScreenshotPromptContainsRubric(t *testing.T) {
-	out := buildScreenshotPrompt("https://x/quickstart", "body", nil, nil)
-	if !strings.Contains(out, "page_role") {
-		t.Error("missing page_role hint")
+func TestBuildScreenshotPrompt_IncludesRoleFromPage(t *testing.T) {
+	page := DocPage{
+		URL:     "https://x/anywhere",
+		Content: "body",
+		Role:    "quickstart",
 	}
+	out := buildScreenshotPrompt(page, nil, nil)
+	if !strings.Contains(out, "page_role: quickstart") {
+		t.Errorf("missing role hint; got:\n%s", out)
+	}
+	// Folded in from the now-deleted TestBuildScreenshotPromptContainsRubric:
+	// the priority rubric is part of the prompt contract — the model must
+	// be asked to emit priority_reason alongside priority.
 	if !strings.Contains(out, "priority_reason") {
-		t.Error("missing priority_reason mention")
-	}
-	if !strings.Contains(out, "quickstart") {
-		t.Error("page_role value not injected")
+		t.Errorf("missing priority_reason mention; got:\n%s", out)
 	}
 }
 
-func TestBuildDetectionPromptWithVerdictsContainsRubric(t *testing.T) {
-	refs := []imageRef{{Src: "x.png", AltText: "a", OriginalIndex: 1}}
-	verdicts := []ImageVerdict{{Index: "img-1", Matches: true}}
-	out := buildDetectionPromptWithVerdicts("https://x/docs/api", "body", refs, verdicts, nil)
-	if !strings.Contains(out, "page_role") {
-		t.Error("missing page_role hint in verdict-enriched prompt")
+func TestBuildDetectionPromptWithVerdicts_IncludesRoleFromPage(t *testing.T) {
+	page := DocPage{
+		URL:     "https://x/docs/api",
+		Content: "body",
+		Role:    "reference",
 	}
+	refs := []imageRef{{Src: "/a.png", AltText: "alt", SectionHeading: "h", ParagraphIndex: 0, OriginalIndex: 1}}
+	verdicts := []ImageVerdict{{Index: "img-1", Matches: true}}
+	out := buildDetectionPromptWithVerdicts(page, refs, verdicts, nil)
+	if !strings.Contains(out, "page_role: reference") {
+		t.Errorf("missing role hint; got:\n%s", out)
+	}
+	// Folded in from the now-deleted
+	// TestBuildDetectionPromptWithVerdictsContainsRubric: the verdict-
+	// enriched detection prompt must still carry the priority rubric.
 	if !strings.Contains(out, "priority_reason") {
-		t.Error("missing priority_reason mention")
+		t.Errorf("missing priority_reason mention; got:\n%s", out)
 	}
 }
 

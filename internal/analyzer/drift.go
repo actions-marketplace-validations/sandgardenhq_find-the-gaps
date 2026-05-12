@@ -2,6 +2,8 @@ package analyzer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,7 +60,14 @@ type CachedDriftEntry struct {
 	Files         []string
 	FilteredPages []string
 	Pages         []string
-	Issues        []DriftIssue
+	// RolesHash is the hex SHA-256 fingerprint of the URL→role mapping for
+	// FilteredPages, as produced by FilteredPagesRolesHash. The judge prompt
+	// embeds these roles in its priority rubric, so a stale RolesHash means
+	// the cached Issues' priorities reflect a prior classification and must
+	// be recomputed. Empty (the zero value) on entries written before this
+	// field shipped — those entries always miss and recompute once.
+	RolesHash string
+	Issues    []DriftIssue
 }
 
 // DriftFeatureDoneFunc fires after DetectDrift decides a feature's drift
@@ -70,8 +79,12 @@ type CachedDriftEntry struct {
 // cache key. pages is the post-classify list that the investigator+judge
 // actually saw. On a cache hit, pages is the previously persisted value.
 //
+// rolesHash is the FilteredPagesRolesHash computed against the run's role
+// resolver and the same sorted filteredPages list. Persisters MUST store it
+// so the next run can invalidate when role classification changes.
+//
 // Return non-nil to abort detection.
-type DriftFeatureDoneFunc func(feature string, files, filteredPages, pages []string, issues []DriftIssue) error
+type DriftFeatureDoneFunc func(feature string, files, filteredPages, pages []string, rolesHash string, issues []DriftIssue) error
 
 // budgetForFeature returns the investigator round budget for a single
 // feature's drift check. Each read_file and read_page tool call costs one
@@ -117,6 +130,7 @@ func DetectDrift(
 	featureMap FeatureMap,
 	docsMap DocsFeatureMap,
 	pageReader func(url string) (string, error),
+	roles RoleResolver,
 	repoRoot string,
 	workers int,
 	cached map[string]CachedDriftEntry,
@@ -189,10 +203,17 @@ func DetectDrift(
 		sortedFiltered := job.sortedFiltered
 		pages := job.pages
 
+		// Fingerprint of the URL→role mapping the judge prompt will see.
+		// Folded into the cache key so a role reclassification on stable
+		// files+pages forces a re-judge instead of replaying stale
+		// priorities. See FilteredPagesRolesHash.
+		currentRolesHash := FilteredPagesRolesHash(roles, sortedFiltered)
+
 		if cached != nil {
 			if c, ok := cached[entry.Feature.Name]; ok &&
 				equalStringSlice(c.Files, sortedFiles) &&
 				equalStringSlice(c.FilteredPages, sortedFiltered) &&
+				c.RolesHash == currentRolesHash &&
 				!cacheNeedsRecompute(c) {
 				log.Debugf("  drift cache hit: %s", entry.Feature.Name)
 				issues := c.Issues
@@ -205,7 +226,7 @@ func DetectDrift(
 					}
 				}
 				if onFeatureDone != nil {
-					if err := onFeatureDone(entry.Feature.Name, sortedFiles, sortedFiltered, c.Pages, issues); err != nil {
+					if err := onFeatureDone(entry.Feature.Name, sortedFiles, sortedFiltered, c.Pages, currentRolesHash, issues); err != nil {
 						return fmt.Errorf("DetectDrift: onFeatureDone: %w", err)
 					}
 				}
@@ -220,7 +241,7 @@ func DetectDrift(
 			// keyed on FilteredPages with empty Pages so the next run skips
 			// the classifier instead of re-running it on the same content.
 			if onFeatureDone != nil {
-				if err := onFeatureDone(entry.Feature.Name, sortedFiles, sortedFiltered, []string{}, nil); err != nil {
+				if err := onFeatureDone(entry.Feature.Name, sortedFiles, sortedFiltered, []string{}, currentRolesHash, nil); err != nil {
 					return fmt.Errorf("DetectDrift: onFeatureDone: %w", err)
 				}
 			}
@@ -242,7 +263,7 @@ func DetectDrift(
 			}
 			return fmt.Errorf("DetectDrift %q: %w", entry.Feature.Name, err)
 		}
-		issues, err := judgeFeatureDrift(ctx, judge, entry.Feature, observations)
+		issues, err := judgeFeatureDrift(ctx, judge, entry.Feature, observations, roles)
 		if err != nil {
 			return fmt.Errorf("DetectDrift %q: %w", entry.Feature.Name, err)
 		}
@@ -256,7 +277,7 @@ func DetectDrift(
 			}
 		}
 		if onFeatureDone != nil {
-			if err := onFeatureDone(entry.Feature.Name, sortedFiles, sortedFiltered, sortedPages, issues); err != nil {
+			if err := onFeatureDone(entry.Feature.Name, sortedFiles, sortedFiltered, sortedPages, currentRolesHash, issues); err != nil {
 				return fmt.Errorf("DetectDrift: onFeatureDone: %w", err)
 			}
 		}
@@ -533,6 +554,33 @@ func uniqueObservationPages(observations []driftObservation) []string {
 	return out
 }
 
+// FilteredPagesRolesHash returns a deterministic hex SHA-256 over the
+// URL→role mapping that the judge prompt will see for sortedFilteredPages.
+// The drift cache stores this fingerprint per feature so a role
+// reclassification on stable files+pages (or the first warm-cache run after
+// upgrading from URL-heuristic to content-based roles) forces a re-judge
+// instead of replaying stale priorities. sortedFilteredPages MUST be sorted
+// ascending; callers in DetectDrift use sortedCopy(filteredPages).
+//
+// Exported so persisters and tests can recompute the same fingerprint
+// without reimplementing the encoding.
+func FilteredPagesRolesHash(roles RoleResolver, sortedFilteredPages []string) string {
+	if roles == nil {
+		roles = NewRoleResolver(nil)
+	}
+	type entry struct {
+		URL  string `json:"url"`
+		Role string `json:"role"`
+	}
+	out := make([]entry, 0, len(sortedFilteredPages))
+	for _, p := range sortedFilteredPages {
+		out = append(out, entry{URL: p, Role: roles(p)})
+	}
+	data, _ := json.Marshal(out)
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
 // cacheNeedsRecompute reports whether a cached drift entry must be discarded
 // because at least one of its issues lacks a valid priority. Older caches
 // written before the priority feature shipped fall through this path; on a
@@ -550,16 +598,17 @@ func cacheNeedsRecompute(entry CachedDriftEntry) bool {
 }
 
 // pageRoleSummary returns a human-readable list of "<url> -> <role>" lines
-// for the pages observed during drift investigation. Fed into the judge
-// prompt so the priority rubric can weight prominent pages higher.
-func pageRoleSummary(pages []string) string {
+// for the pages observed during drift investigation. Roles come from the
+// per-run RoleResolver (built from the page-analysis cache). Fed into the
+// judge prompt so the priority rubric can weight prominent pages higher.
+func pageRoleSummary(roles RoleResolver, pages []string) string {
 	if len(pages) == 0 {
 		return "Page role hints: (no specific pages)"
 	}
 	var b strings.Builder
 	b.WriteString("Page role hints:\n")
 	for _, p := range pages {
-		fmt.Fprintf(&b, "- %s -> %s\n", p, pageRole(p))
+		fmt.Fprintf(&b, "- %s -> %s\n", p, roles(p))
 	}
 	return b.String()
 }
@@ -585,12 +634,13 @@ func judgeFeatureDrift(
 	client LLMClient,
 	feature CodeFeature,
 	observations []driftObservation,
+	roles RoleResolver,
 ) ([]DriftIssue, error) {
 	if len(observations) == 0 {
 		return nil, nil
 	}
 
-	issues, err := judgeOneShot(ctx, client, feature, observations)
+	issues, err := judgeOneShot(ctx, client, feature, observations, roles)
 	if err == nil {
 		return issues, nil
 	}
@@ -601,12 +651,12 @@ func judgeFeatureDrift(
 	// Compaction path: split observations into the smallest number of
 	// groups whose rendered prompts each fit within the budget, judge
 	// each, and merge.
-	chunks := chunkObservationsToFit(client, feature, observations)
+	chunks := chunkObservationsToFit(client, feature, observations, roles)
 	log.Warnf("judge prompt for %q exceeded token budget; compacting into %d chunks", feature.Name, len(chunks))
 
 	var all []DriftIssue
 	for i, chunk := range chunks {
-		chunkIssues, err := judgeOneShot(ctx, client, feature, chunk)
+		chunkIssues, err := judgeOneShot(ctx, client, feature, chunk, roles)
 		if err != nil {
 			return nil, fmt.Errorf("judgeFeatureDrift %q: chunk %d/%d: %w", feature.Name, i+1, len(chunks), err)
 		}
@@ -624,8 +674,9 @@ func judgeOneShot(
 	client LLMClient,
 	feature CodeFeature,
 	observations []driftObservation,
+	roles RoleResolver,
 ) ([]DriftIssue, error) {
-	prompt := renderJudgePrompt(feature, observations)
+	prompt := renderJudgePrompt(feature, observations, roles)
 
 	// Retry on transport error / malformed JSON / schema-validation
 	// failure. ErrTokenBudgetExceeded is NOT retried — it's deterministic
@@ -665,7 +716,7 @@ func judgeOneShot(
 // specific observation set. Extracted from judgeOneShot so
 // chunkObservationsToFit can size candidate chunks against the same
 // rendering used at send time.
-func renderJudgePrompt(feature CodeFeature, observations []driftObservation) string {
+func renderJudgePrompt(feature CodeFeature, observations []driftObservation, roles RoleResolver) string {
 	var b strings.Builder
 	for i, o := range observations {
 		fmt.Fprintf(&b, "[%d] page: %s\n    docs say: %q\n    code shows: %q\n    concern: %s\n",
@@ -698,7 +749,7 @@ priority_reason). Do not add any other fields.
 
 If every observation is a false alarm, emit an empty "issues" array.`,
 		feature.Name, feature.Description, b.String(),
-		pageRoleSummary(uniqueObservationPages(observations)),
+		pageRoleSummary(roles, uniqueObservationPages(observations)),
 		priorityRubric)
 }
 
@@ -724,7 +775,7 @@ func clipObservationQuotes(o driftObservation, max int) driftObservation {
 // observations are clipped to clipQuoteMaxChars first. When the model
 // has no budget (MaxInputTokens == 0), returns one chunk containing all
 // observations.
-func chunkObservationsToFit(client LLMClient, feature CodeFeature, obs []driftObservation) [][]driftObservation {
+func chunkObservationsToFit(client LLMClient, feature CodeFeature, obs []driftObservation, roles RoleResolver) [][]driftObservation {
 	caps := client.Capabilities()
 	if caps.MaxInputTokens <= 0 {
 		return [][]driftObservation{obs}
@@ -741,7 +792,7 @@ func chunkObservationsToFit(client LLMClient, feature CodeFeature, obs []driftOb
 	for _, o := range clipped {
 		candidate := append([]driftObservation{}, cur...)
 		candidate = append(candidate, o)
-		if countTokens(renderJudgePrompt(feature, candidate)) > budget && len(cur) > 0 {
+		if countTokens(renderJudgePrompt(feature, candidate, roles)) > budget && len(cur) > 0 {
 			// `cur` was the last chunk that fit; flush it.
 			chunks = append(chunks, cur)
 			cur = []driftObservation{o}
