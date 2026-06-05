@@ -16,6 +16,7 @@ import (
 
 	"github.com/charmbracelet/log"
 	"github.com/sandgardenhq/find-the-gaps/internal/analyzer"
+	"github.com/sandgardenhq/find-the-gaps/internal/docholiday"
 	"github.com/sandgardenhq/find-the-gaps/internal/doctor"
 	"github.com/sandgardenhq/find-the-gaps/internal/forge"
 	"github.com/sandgardenhq/find-the-gaps/internal/linkcheck"
@@ -496,28 +497,36 @@ func newAnalyzeCmd() *cobra.Command {
 				}
 			}
 
-			if !driftSkipped {
-				// Per-feature rationales for the Undocumented Features section
-				// of gaps.md. We cache rationales by hash(name+description+layer)
-				// so unchanged features skip the LLM call on rerun. Only newly
-				// undocumented or content-changed features hit the small tier.
-				// A failure degrades gracefully — the reporter falls back to
-				// a generic blurb when a key is missing.
-				whyCachePath := filepath.Join(projectDir, "why-document.json")
-				whyCache := loadWhyDocumentCache(whyCachePath)
-				undocFeatures := reporter.UndocumentedFeatures(featureMap, docCoveredFeatures)
-				whyRationales := make(map[string]string, len(undocFeatures))
-				var toFetch []analyzer.CodeFeature
-				freshCache := make(map[string]whyDocumentCacheEntry, len(undocFeatures))
-				for _, e := range undocFeatures {
-					hash := whyDocumentInputHash(e.Feature)
-					if cached, ok := whyCache[e.Feature.Name]; ok && cached.Hash == hash && cached.Rationale != "" {
-						whyRationales[e.Feature.Name] = cached.Rationale
-						freshCache[e.Feature.Name] = cached
-						continue
-					}
-					toFetch = append(toFetch, e.Feature)
+			// Per-feature rationales for the Undocumented Features section of
+			// gaps.md AND for the doc-holiday prompt phase below. We cache
+			// rationales by hash(name+description+layer) so unchanged features
+			// skip the LLM call on rerun. The cache LOAD + hit population is
+			// disk-only (no LLM) and runs UNCONDITIONALLY — independent of the
+			// drift sentinel — so a warm, drift-cached run repopulates
+			// whyRationales from the why-document.json a prior cold run wrote.
+			// That keeps the prompt phase's per-unit cache keys stable
+			// cold↔warm (empty rationales would silently change the keys and
+			// force a fresh LLM call per undocumented feature on every warm run).
+			// The LLM fetch for cache MISSES and the cache SAVE stay inside the
+			// !driftSkipped block. A failure degrades gracefully — the reporter
+			// falls back to a generic blurb when a key is missing.
+			whyRationales := map[string]string{}
+			whyCachePath := filepath.Join(projectDir, "why-document.json")
+			whyCache := loadWhyDocumentCache(whyCachePath)
+			undocFeatures := reporter.UndocumentedFeatures(featureMap, docCoveredFeatures)
+			var toFetch []analyzer.CodeFeature
+			freshCache := make(map[string]whyDocumentCacheEntry, len(undocFeatures))
+			for _, e := range undocFeatures {
+				hash := whyDocumentInputHash(e.Feature)
+				if cached, ok := whyCache[e.Feature.Name]; ok && cached.Hash == hash && cached.Rationale != "" {
+					whyRationales[e.Feature.Name] = cached.Rationale
+					freshCache[e.Feature.Name] = cached
+					continue
 				}
+				toFetch = append(toFetch, e.Feature)
+			}
+
+			if !driftSkipped {
 				if len(toFetch) > 0 {
 					fresh, whyErr := analyzer.WhyDocument(ctx, tiering, toFetch)
 					if whyErr != nil {
@@ -598,6 +607,28 @@ func newAnalyzeCmd() *cobra.Command {
 				}); err != nil {
 					return fmt.Errorf("save drift completion: %w", err)
 				}
+			}
+
+			// Doc Holiday prompt generation: author ready-to-paste prompts for
+			// the stale-docs and missing-docs gaps. Default-on; reuses the
+			// typical tier and a per-unit prompts-cache.json. undocFeatures and
+			// whyRationales were resolved above (unconditionally, from the disk
+			// cache), so the prompt phase sees identical inputs — and identical
+			// per-unit cache keys — whether or not drift was cached-complete.
+			prompts, err := docholiday.GeneratePrompts(ctx, tiering.Typical(), docholiday.Input{
+				Drift:        driftFindings,
+				Undocumented: undocFeatures,
+				Rationales:   whyRationales,
+			}, docholiday.Options{
+				ProjectDir: projectDir,
+				Workers:    workers,
+				NoCache:    noCache,
+			})
+			if err != nil {
+				return fmt.Errorf("generate doc-holiday prompts: %w", err)
+			}
+			if err := reporter.WritePrompts(projectDir, prompts); err != nil {
+				return fmt.Errorf("write prompts.md: %w", err)
 			}
 
 			var screenshotResult analyzer.ScreenshotResult
@@ -856,14 +887,18 @@ func newAnalyzeCmd() *cobra.Command {
 			if noPDF {
 				pdfLine += " (skipped)"
 			}
+			promptsLine := "  " + projectDir + "/prompts.md"
+			if c := promptsCounts(prompts); c != "" {
+				promptsLine += " (" + c + ")"
+			}
 			extraLine := ""
 			if keepSiteSource && !noSite {
 				extraLine = "\n  " + projectDir + "/site-src/"
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(),
-				"scanned %d files, fetched %d pages, %d features mapped\nreports:\n  %s/mapping.md\n%s\n%s\n%s\n%s\n%s%s\n",
+				"scanned %d files, fetched %d pages, %d features mapped\nreports:\n  %s/mapping.md\n%s\n%s\n%s\n%s\n%s\n%s%s\n",
 				len(scan.Files), len(pages), len(featureMap),
-				projectDir, gapsLine, screenshotsLine, linksLine, siteLine, pdfLine, extraLine)
+				projectDir, gapsLine, screenshotsLine, linksLine, siteLine, pdfLine, promptsLine, extraLine)
 
 			decision := decideAutoServe(noSite, noServe, humanPresent(), os.Getenv)
 			if decision.Serve {
